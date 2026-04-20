@@ -652,13 +652,12 @@ mod tests {
         responses: Mutex<Vec<LlmOutput>>,
     }
 
+    use crate::testing::code_final;
+
     impl MockLlm {
         fn text(msg: &str) -> Arc<Self> {
             Arc::new(Self {
-                responses: Mutex::new(vec![LlmOutput {
-                    response: LlmResponse::Text(msg.into()),
-                    usage: TokenUsage::default(),
-                }]),
+                responses: Mutex::new(vec![code_final(msg)]),
             })
         }
     }
@@ -673,10 +672,7 @@ mod tests {
         ) -> Result<LlmOutput, EngineError> {
             let mut r = self.responses.lock().unwrap();
             if r.is_empty() {
-                Ok(LlmOutput {
-                    response: LlmResponse::Text("done".into()),
-                    usage: TokenUsage::default(),
-                })
+                Ok(code_final("done"))
             } else {
                 Ok(r.remove(0))
             }
@@ -1152,6 +1148,14 @@ mod tests {
         );
     }
 
+    /// A running thread that calls `tool_install` mid-execution must be able
+    /// to use the newly-installed tool in a subsequent iteration of the SAME
+    /// thread — without the user having to send another message. The engine
+    /// handles this via `reconcile_dynamic_tool_lease()` between iterations.
+    ///
+    /// Code-only variant: iteration 1 runs `await tool_install(...)` without
+    /// FINAL; between iterations the lease reconciler exposes the new action;
+    /// iteration 2 runs `await notion_search(...)` and FINALs.
     #[tokio::test]
     async fn running_thread_can_install_then_use_new_tool_without_user_bounce() {
         let store = Arc::new(MockStore::new());
@@ -1180,32 +1184,26 @@ mod tests {
         ];
         let effects = DynamicEffects::new(initial_actions);
         effects.set_install_reveals(revealed_actions).await;
+
+        let install_code = r#"await tool_install(name="notion")"#.to_string();
+        let search_code =
+            r#"result = await notion_search(query="latest meeting note"); FINAL(result)"#
+                .to_string();
+
         let llm = Arc::new(MockLlm {
             responses: Mutex::new(vec![
                 LlmOutput {
-                    response: LlmResponse::ActionCalls {
-                        calls: vec![crate::types::step::ActionCall {
-                            id: "call_install".into(),
-                            action_name: "tool_install".into(),
-                            parameters: serde_json::json!({"name": "notion"}),
-                        }],
-                        content: None,
+                    response: LlmResponse::Code {
+                        code: install_code.clone(),
+                        content: Some(format!("```repl\n{install_code}\n```")),
                     },
                     usage: TokenUsage::default(),
                 },
                 LlmOutput {
-                    response: LlmResponse::ActionCalls {
-                        calls: vec![crate::types::step::ActionCall {
-                            id: "call_search".into(),
-                            action_name: "notion_search".into(),
-                            parameters: serde_json::json!({"query": "latest meeting note"}),
-                        }],
-                        content: None,
+                    response: LlmResponse::Code {
+                        code: search_code.clone(),
+                        content: Some(format!("```repl\n{search_code}\n```")),
                     },
-                    usage: TokenUsage::default(),
-                },
-                LlmOutput {
-                    response: LlmResponse::Text("done".into()),
                     usage: TokenUsage::default(),
                 },
             ]),
@@ -1231,22 +1229,20 @@ mod tests {
         assert_eq!(
             calls,
             vec!["tool_install".to_string(), "notion_search".to_string()],
-            "thread should continue from install into the newly exposed tool without pausing for a new user turn"
+            "thread should continue from install into the newly exposed tool \
+             without pausing for a new user turn"
         );
     }
 
     #[tokio::test]
     async fn stop_thread_works() {
-        // LLM that returns many action responses
+        // LLM that keeps running code without ever emitting FINAL, forcing
+        // the loop to keep going until we send a stop signal.
         let responses: Vec<LlmOutput> = (0..100)
             .map(|i| LlmOutput {
-                response: LlmResponse::ActionCalls {
-                    calls: vec![crate::types::step::ActionCall {
-                        id: format!("c{i}"),
-                        action_name: "test_tool".into(),
-                        parameters: serde_json::json!({}),
-                    }],
-                    content: None,
+                response: LlmResponse::Code {
+                    code: format!("x = {i}"),
+                    content: Some(format!("```repl\nx = {i}\n```")),
                 },
                 usage: TokenUsage::default(),
             })

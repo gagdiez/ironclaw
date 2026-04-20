@@ -352,63 +352,7 @@ impl ExecutionLoop {
 
 #[cfg(test)]
 mod tests {
-    /// Extract a FINAL() answer from the LLM's text response.
-    ///
-    /// Matches `FINAL(...)` anywhere in the text, handling:
-    /// - Single-line: `FINAL("the answer")`
-    /// - Multi-line: `FINAL("""\n...\n""")`
-    /// - With or without quotes
-    fn extract_final_from_text(text: &str) -> Option<String> {
-        let marker = "FINAL(";
-        let start = text.find(marker)?;
-        let content_start = start + marker.len();
-        let remaining = &text[content_start..];
-
-        // Try triple-quoted string first: FINAL("""...""")
-        if remaining.starts_with("\"\"\"") {
-            let inner_start = 3;
-            if let Some(end) = remaining[inner_start..].find("\"\"\"") {
-                let answer = remaining[inner_start..inner_start + end].trim();
-                if !answer.is_empty() {
-                    return Some(answer.to_string());
-                }
-            }
-        }
-
-        // Try single/double quoted: FINAL("...") or FINAL('...')
-        if remaining.starts_with('"') || remaining.starts_with('\'') {
-            let quote = remaining.as_bytes()[0] as char;
-            if let Some(end) = remaining[1..].find(quote) {
-                let answer = &remaining[1..1 + end];
-                if !answer.is_empty() {
-                    return Some(answer.to_string());
-                }
-            }
-        }
-
-        // Unquoted: FINAL(some content here) — find matching close paren
-        let mut depth = 1;
-        for (i, ch) in remaining.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let answer = remaining[..i].trim(); // safety: i is from char_indices(), always a valid boundary
-                        if !answer.is_empty() {
-                            return Some(answer.to_string());
-                        }
-                        return None;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        None
-    }
     use super::*;
-    use crate::runtime::messaging::ThreadSignal;
     use crate::traits::effect::ThreadExecutionContext;
     use crate::traits::llm::{LlmCallConfig, LlmOutput};
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
@@ -416,6 +360,8 @@ mod tests {
     use crate::types::step::LlmResponse;
     use crate::types::step::{ActionResult, TokenUsage};
     use crate::types::thread::{ThreadConfig, ThreadType};
+
+    use crate::runtime::messaging::ThreadSignal;
 
     use std::sync::Mutex;
     use std::time::Duration;
@@ -445,7 +391,10 @@ mod tests {
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 Ok(LlmOutput {
-                    response: LlmResponse::Text("(no more responses)".into()),
+                    response: LlmResponse::Code {
+                        code: "FINAL('(no more responses)')".into(),
+                        content: Some("```repl\nFINAL('(no more responses)')\n```".into()),
+                    },
                     usage: TokenUsage::default(),
                 })
             } else {
@@ -507,35 +456,6 @@ mod tests {
 
     // ── Helpers ─────────────────────────────────────────────
 
-    fn text_response(text: &str) -> LlmOutput {
-        LlmOutput {
-            response: LlmResponse::Text(text.into()),
-            usage: TokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                ..Default::default()
-            },
-        }
-    }
-
-    fn action_response(action_name: &str, call_id: &str) -> LlmOutput {
-        LlmOutput {
-            response: LlmResponse::ActionCalls {
-                calls: vec![crate::types::step::ActionCall {
-                    id: call_id.into(),
-                    action_name: action_name.into(),
-                    parameters: serde_json::json!({}),
-                }],
-                content: None,
-            },
-            usage: TokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                ..Default::default()
-            },
-        }
-    }
-
     fn test_action() -> ActionDef {
         ActionDef {
             name: "test_tool".into(),
@@ -580,68 +500,29 @@ mod tests {
 
     // ── Tests ───────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn text_response_completes() {
-        let (mut exec, _tx) = make_loop(
-            vec![text_response("Hello!")],
-            vec![],
-            ThreadConfig::default(),
-        )
-        .await;
-
-        let outcome = exec.run().await.unwrap();
-        assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Hello!"));
-        assert!(exec.thread.state.is_terminal() || exec.thread.state == ThreadState::Completed);
-        assert_eq!(exec.thread.step_count, 1);
-        assert!(exec.thread.total_tokens_used > 0);
+    fn code_response(code: &str) -> LlmOutput {
+        LlmOutput {
+            response: LlmResponse::Code {
+                code: code.into(),
+                content: Some(format!("```repl\n{code}\n```")),
+            },
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 80,
+                ..Default::default()
+            },
+        }
     }
 
-    #[tokio::test]
-    async fn action_then_text() {
-        let (mut exec, _tx) = make_loop(
-            vec![
-                action_response("test_tool", "call_1"),
-                text_response("Done!"),
-            ],
-            vec![Ok(ActionResult {
-                call_id: "call_1".into(),
-                action_name: "test_tool".into(),
-                output: serde_json::json!({"data": "result"}),
-                is_error: false,
-                duration: Duration::from_millis(5),
-            })],
-            ThreadConfig::default(),
-        )
-        .await;
+    // ── Loop lifecycle tests ────────────────────────────────
 
-        let outcome = exec.run().await.unwrap();
-        assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Done!"));
-        assert_eq!(exec.thread.step_count, 2);
-        // Orchestrator-driven flow: working messages live in `internal_messages`
-        // (set by `sync_runtime_state` when the orchestrator persists state),
-        // while `thread.messages` only carries the system prompt + final
-        // assistant response. The full conversation transcript (system,
-        // assistant+actions, action_result, assistant) is in internal_messages.
-        assert!(exec.thread.internal_messages.len() >= 3);
-    }
-
+    /// Loop must exit with MaxIterations when the LLM never emits FINAL.
+    /// Safety invariant — without this guard, a misbehaving model could
+    /// burn the entire token budget in an endless loop.
     #[tokio::test]
     async fn max_iterations_reached() {
-        // LLM always returns actions, so it never exits naturally
-        let many_actions: Vec<LlmOutput> = (0..5)
-            .map(|i| action_response("test_tool", &format!("call_{i}")))
-            .collect();
-
-        let many_results: Vec<Result<ActionResult, EngineError>> = (0..5)
-            .map(|i| {
-                Ok(ActionResult {
-                    call_id: format!("call_{i}"),
-                    action_name: "test_tool".into(),
-                    output: serde_json::json!({"i": i}),
-                    is_error: false,
-                    duration: Duration::from_millis(1),
-                })
-            })
+        let responses: Vec<LlmOutput> = (0..5)
+            .map(|i| code_response(&format!("x = {i}")))
             .collect();
 
         let config = ThreadConfig {
@@ -649,15 +530,9 @@ mod tests {
             ..ThreadConfig::default()
         };
 
-        let (mut exec, _tx) = make_loop(many_actions, many_results, config).await;
+        let (mut exec, _tx) = make_loop(responses, vec![], config).await;
 
         let outcome = exec.run().await.unwrap();
-        // The last iteration forces text mode, and MockLlm returns action_response
-        // which gets treated as the 3rd iteration, then on the 3rd iteration force_text
-        // is set. But MockLlm ignores force_text. So we get MaxIterations after 3 iterations.
-        // Actually, max_iterations=3, and force_text is set when iteration >= max-1 = 2,
-        // so iteration 2 (0-indexed) has force_text. The MockLlm still returns action calls,
-        // so we loop 3 times and exit.
         assert!(matches!(
             outcome,
             ThreadOutcome::MaxIterations | ThreadOutcome::Completed { .. }
@@ -665,38 +540,28 @@ mod tests {
         assert!(exec.thread.step_count <= 3);
     }
 
+    /// A stop signal mid-loop must interrupt execution and yield Stopped.
     #[tokio::test]
     async fn stop_signal_exits() {
-        // LLM would loop forever, but we send a stop signal
-        let many_actions: Vec<LlmOutput> = (0..100)
-            .map(|i| action_response("test_tool", &format!("call_{i}")))
+        // 100 no-FINAL code responses — loop would run forever without stop.
+        let responses: Vec<LlmOutput> = (0..100)
+            .map(|i| code_response(&format!("x = {i}")))
             .collect();
 
-        let many_results: Vec<Result<ActionResult, EngineError>> = (0..100)
-            .map(|i| {
-                Ok(ActionResult {
-                    call_id: format!("call_{i}"),
-                    action_name: "test_tool".into(),
-                    output: serde_json::json!({}),
-                    is_error: false,
-                    duration: Duration::from_millis(1),
-                })
-            })
-            .collect();
+        let (mut exec, tx) = make_loop(responses, vec![], ThreadConfig::default()).await;
 
-        let (mut exec, tx) = make_loop(many_actions, many_results, ThreadConfig::default()).await;
-
-        // Send stop before first iteration
         tx.send(ThreadSignal::Stop).await.unwrap();
 
         let outcome = exec.run().await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Stopped));
     }
 
+    /// A message injected via ThreadSignal::InjectMessage must appear in
+    /// the thread transcript so subsequent iterations see it.
     #[tokio::test]
     async fn inject_message_appears_in_context() {
         let (mut exec, tx) = make_loop(
-            vec![text_response("Got your message")],
+            vec![code_response("FINAL('Got your message')")],
             vec![],
             ThreadConfig::default(),
         )
@@ -714,46 +579,18 @@ mod tests {
             exec.thread
                 .messages
                 .iter()
-                .any(|m| m.content == "injected!")
+                .chain(exec.thread.internal_messages.iter())
+                .any(|m| m.content == "injected!"),
+            "injected message should appear in thread transcript",
         );
     }
 
-    #[tokio::test]
-    async fn tool_intent_nudge_injected() {
-        let (mut exec, _tx) = make_loop(
-            vec![
-                text_response("Let me search for that"),
-                text_response("The answer is 42"),
-            ],
-            vec![],
-            ThreadConfig {
-                enable_tool_intent_nudge: true,
-                max_tool_intent_nudges: 2,
-                ..ThreadConfig::default()
-            },
-        )
-        .await;
-
-        let outcome = exec.run().await.unwrap();
-        assert!(
-            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "The answer is 42")
-        );
-        assert_eq!(exec.thread.step_count, 2);
-        // Nudge is injected into the orchestrator's working messages, which
-        // are persisted as `thread.internal_messages` (not the user-visible
-        // `messages` transcript).
-        assert!(
-            exec.thread
-                .internal_messages
-                .iter()
-                .any(|m| m.content.contains("did not include any tool calls"))
-        );
-    }
-
+    /// Lifecycle events must be emitted: at minimum StateChanged transitions
+    /// and StepStarted/StepCompleted pairs. Observability invariant.
     #[tokio::test]
     async fn events_are_recorded() {
         let (mut exec, _tx) = make_loop(
-            vec![text_response("Hello!")],
+            vec![code_response("FINAL('Hello!')")],
             vec![],
             ThreadConfig::default(),
         )
@@ -761,18 +598,9 @@ mod tests {
 
         exec.run().await.unwrap();
 
-        let _event_kinds: Vec<String> = exec
-            .thread
-            .events
-            .iter()
-            .map(|e| format!("{:?}", std::mem::discriminant(&e.kind)))
-            .collect();
-
-        // Should have: StateChanged(Created->Running), StepStarted, MessageAdded,
-        // StepCompleted, StateChanged(Running->Completed)
         assert!(exec.thread.events.len() >= 4);
 
-        // Verify first event is state change to Running
+        // First event must be StateChanged(Created -> Running).
         assert!(matches!(
             &exec.thread.events[0].kind,
             EventKind::StateChanged {
@@ -783,21 +611,106 @@ mod tests {
         ));
     }
 
-    // ── CodeAct / RLM tests ─────────────────────────────────
+    // ── call_id propagation through the code path ──────────
+    //
+    // Tool calls dispatched from inside Python (via Monty host functions)
+    // still flow through the same EffectExecutor pipeline. Recorded
+    // ActionResult messages and ActionExecuted events MUST carry non-empty
+    // call_ids so the LLM API doesn't reject subsequent requests with
+    // "No tool output found for function call <id>".
 
-    fn code_response(code: &str) -> LlmOutput {
-        LlmOutput {
-            response: LlmResponse::Code {
-                code: code.into(),
-                content: Some(format!("```repl\n{code}\n```")),
-            },
-            usage: TokenUsage {
-                input_tokens: 100,
-                output_tokens: 80,
-                ..Default::default()
-            },
+
+    /// Code-path tool calls must produce ActionExecuted events with
+    /// non-empty call_ids. Tool calls are async — they must be awaited.
+    #[tokio::test]
+    async fn action_executed_events_carry_call_id() {
+        let (mut exec, _tx) = make_loop(
+            vec![code_response(
+                "result = await test_tool()\nFINAL('ok')",
+            )],
+            vec![Ok(ActionResult {
+                call_id: String::new(), // EffectExecutor returns empty — engine must fill
+                action_name: "test_tool".into(),
+                output: serde_json::json!({"data": "result"}),
+                is_error: false,
+                duration: Duration::from_millis(5),
+            })],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        exec.run().await.unwrap();
+
+        let exec_events: Vec<_> = exec
+            .thread
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ActionExecuted { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !exec_events.is_empty(),
+            "should have at least one ActionExecuted event after awaiting test_tool()"
+        );
+        for call_id in &exec_events {
+            assert!(
+                !call_id.is_empty(),
+                "ActionExecuted event must have non-empty call_id"
+            );
         }
     }
+
+    /// When a code-path tool call returns an error, the recorded
+    /// ActionFailed event must carry a non-empty call_id. This keeps
+    /// traces correlatable and prevents the downstream LLM API from
+    /// rejecting the sequence with "No tool output found for function
+    /// call <id>".
+    #[tokio::test]
+    async fn failed_action_preserves_call_id_in_message_and_event() {
+        // MockEffects returns an is_error=true result; scripting.rs surfaces
+        // this as ActionFailed via resolve_tool_future:1544. Lease denial
+        // isn't a viable path here because `reconcile_dynamic_tool_lease`
+        // auto-grants a "tools" lease covering every available action.
+        let (mut exec, _tx) = make_loop(
+            vec![code_response(
+                "result = await test_tool()\nFINAL('done')",
+            )],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "test_tool".into(),
+                output: serde_json::json!({"error": "simulated tool failure"}),
+                is_error: true,
+                duration: Duration::from_millis(1),
+            })],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        exec.run().await.unwrap();
+
+        let fail_events: Vec<_> = exec
+            .thread
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ActionFailed { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !fail_events.is_empty(),
+            "expected at least one ActionFailed event when the tool returned is_error=true"
+        );
+        for call_id in &fail_events {
+            assert!(!call_id.is_empty(), "ActionFailed event must have call_id");
+        }
+    }
+
+    // ── CodeAct / RLM tests ─────────────────────────────────
 
     #[tokio::test]
     async fn codeact_simple_final() {
@@ -1009,320 +922,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn codeact_final_in_text_response() {
-        // LLM outputs FINAL() as plain text (not in a code block)
-        // This is the Hyperliquid case — model writes explanation + FINAL()
-        let (mut exec, _tx) = make_loop(
-            vec![text_response(
-                "Based on my analysis, the answer is clear.\n\nFINAL(\"Revenue grows with volume\")",
-            )],
-            vec![],
-            ThreadConfig::default(),
-        )
-        .await;
-
-        let outcome = exec.run().await.unwrap();
-        assert!(
-            matches!(outcome, ThreadOutcome::Completed { response: Some(ref r) } if r == "Revenue grows with volume"),
-            "got: {outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn codeact_final_triple_quoted_in_text() {
-        // FINAL with triple-quoted multi-line string in plain text
-        let (mut exec, _tx) = make_loop(
-            vec![text_response(
-                "Here's the summary:\n\nFINAL(\"\"\"\nLine 1\nLine 2\nLine 3\n\"\"\")",
-            )],
-            vec![],
-            ThreadConfig::default(),
-        )
-        .await;
-
-        let outcome = exec.run().await.unwrap();
-        match outcome {
-            ThreadOutcome::Completed { response: Some(r) } => {
-                assert!(r.contains("Line 1"), "got: {r}");
-                assert!(r.contains("Line 3"), "got: {r}");
-            }
-            other => panic!("expected Completed, got {other:?}"),
-        }
-    }
-
-    // ── extract_final_from_text unit tests ──────────────────
-
-    #[test]
-    fn final_double_quoted() {
-        let text = "some text\nFINAL(\"the answer\")";
-        assert_eq!(extract_final_from_text(text).unwrap(), "the answer");
-    }
-
-    #[test]
-    fn final_single_quoted() {
-        let text = "FINAL('hello world')";
-        assert_eq!(extract_final_from_text(text).unwrap(), "hello world");
-    }
-
-    #[test]
-    fn final_triple_quoted() {
-        let text = "FINAL(\"\"\"\nmulti\nline\n\"\"\")";
-        assert_eq!(extract_final_from_text(text).unwrap(), "multi\nline");
-    }
-
-    #[test]
-    fn final_unquoted() {
-        let text = "FINAL(42)";
-        assert_eq!(extract_final_from_text(text).unwrap(), "42");
-    }
-
-    #[test]
-    fn final_with_nested_parens() {
-        let text = "FINAL(f'result is {len(items)}')";
-        assert_eq!(
-            extract_final_from_text(text).unwrap(),
-            "f'result is {len(items)}'"
-        );
-    }
-
-    #[test]
-    fn no_final_returns_none() {
-        assert!(extract_final_from_text("just regular text").is_none());
-    }
-
-    #[test]
-    fn final_after_long_text() {
-        let text = "A very long explanation...\n\n🔚 Final Thought\n\nFINAL(\"the conclusion\")";
-        assert_eq!(extract_final_from_text(text).unwrap(), "the conclusion");
-    }
-
-    // ── call_id propagation through orchestrator pipeline ────
-    //
-    // These tests verify the end-to-end flow: LLM returns ActionCalls with
-    // call_ids → orchestrator executes them → ActionResult messages on the
-    // thread have correct call_ids (not empty). This catches the class of
-    // bugs that caused OpenAI/Codex HTTP 400 rejections.
-
-    #[tokio::test]
-    async fn action_result_messages_have_correct_call_id() {
-        // LLM returns a tool call, then a text response
-        let (mut exec, _tx) = make_loop(
-            vec![
-                action_response("test_tool", "call_xK9mZq123"),
-                text_response("Done!"),
-            ],
-            vec![Ok(ActionResult {
-                call_id: String::new(), // EffectExecutor returns empty
-                action_name: "test_tool".into(),
-                output: serde_json::json!({"data": "result"}),
-                is_error: false,
-                duration: Duration::from_millis(5),
-            })],
-            ThreadConfig::default(),
-        )
-        .await;
-
-        exec.run().await.unwrap();
-
-        // Find the ActionResult message in the internal orchestrator transcript
-        let action_results: Vec<_> = exec
-            .thread
-            .internal_messages
-            .iter()
-            .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
-            .collect();
-
-        assert!(
-            !action_results.is_empty(),
-            "thread should have at least one internal ActionResult message"
-        );
-
-        for msg in &action_results {
-            let call_id = msg.action_call_id.as_deref().unwrap_or("");
-            assert!(
-                !call_id.is_empty(),
-                "ActionResult message must have non-empty call_id, got empty for tool '{}'",
-                msg.action_name.as_deref().unwrap_or("?")
-            );
-        }
-    }
-
-    /// Verify that the ActionExecuted event carries the call_id from the LLM.
-    #[tokio::test]
-    async fn action_executed_events_carry_call_id() {
-        let (mut exec, _tx) = make_loop(
-            vec![
-                action_response("test_tool", "call_evt_id_42"),
-                text_response("ok"),
-            ],
-            vec![Ok(ActionResult {
-                call_id: String::new(),
-                action_name: "test_tool".into(),
-                output: serde_json::json!({}),
-                is_error: false,
-                duration: Duration::from_millis(1),
-            })],
-            ThreadConfig::default(),
-        )
-        .await;
-
-        exec.run().await.unwrap();
-
-        let exec_events: Vec<_> = exec
-            .thread
-            .events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::ActionExecuted { call_id, .. } => Some(call_id.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(!exec_events.is_empty(), "should have ActionExecuted events");
-        for call_id in &exec_events {
-            assert!(
-                !call_id.is_empty(),
-                "ActionExecuted event must have non-empty call_id"
-            );
-        }
-    }
-
-    /// When a tool call fails (no lease), the internal ActionResult message and
-    /// ActionFailed event must still carry the original call_id.
-    #[tokio::test]
-    async fn failed_action_preserves_call_id_in_message_and_event() {
-        let project_id = ProjectId::new();
-        let thread = Thread::new(
-            "test",
-            ThreadType::Foreground,
-            project_id,
-            "test-user",
-            ThreadConfig::default(),
-        );
-        let tid = thread.id;
-
-        // Create a tool that requires a separate capability
-        let missing_action = ActionDef {
-            name: "restricted_tool".into(),
-            description: "A tool with no lease".into(),
-            parameters_schema: serde_json::json!({"type": "object"}),
-            effects: vec![EffectType::WriteExternal],
-            requires_approval: false,
-        };
-
-        let llm = Arc::new(MockLlm::new(vec![
-            // LLM calls a tool the thread has no lease for
-            LlmOutput {
-                response: LlmResponse::ActionCalls {
-                    calls: vec![crate::types::step::ActionCall {
-                        id: "call_nolease_xyz".into(),
-                        action_name: "restricted_tool".into(),
-                        parameters: serde_json::json!({}),
-                    }],
-                    content: None,
-                },
-                usage: TokenUsage::default(),
-            },
-            text_response("I couldn't access that tool"),
-        ]));
-        let effects = Arc::new(MockEffects::new(vec![missing_action], vec![]));
-        let leases = Arc::new(LeaseManager::new());
-        let policy = Arc::new(PolicyEngine::new());
-
-        // Grant a lease that does NOT cover "restricted_tool"
-        leases
-            .grant(tid, "basic_cap", GrantedActions::All, None, None)
-            .await
-            .unwrap();
-
-        let (_tx, rx) = crate::runtime::messaging::signal_channel(16);
-        let mut exec =
-            ExecutionLoop::new(thread, llm, effects, leases, policy, rx, "test-user".into());
-
-        exec.run().await.unwrap();
-
-        // Check internal ActionResult messages
-        let action_results: Vec<_> = exec
-            .thread
-            .internal_messages
-            .iter()
-            .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
-            .collect();
-
-        for msg in &action_results {
-            let call_id = msg.action_call_id.as_deref().unwrap_or("");
-            assert!(
-                !call_id.is_empty(),
-                "even failed ActionResult must have call_id"
-            );
-        }
-
-        // Check ActionFailed events
-        let fail_events: Vec<_> = exec
-            .thread
-            .events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::ActionFailed {
-                    call_id,
-                    action_name,
-                    ..
-                } => Some((call_id.clone(), action_name.clone())),
-                _ => None,
-            })
-            .collect();
-
-        for (call_id, _name) in &fail_events {
-            assert!(!call_id.is_empty(), "ActionFailed event must have call_id");
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_action_result_is_explicit_in_next_llm_message() {
-        let (mut exec, _tx) = make_loop(
-            vec![
-                action_response("test_tool", "call_failed_tool"),
-                text_response("I could not complete that."),
-            ],
-            vec![Ok(ActionResult {
-                call_id: String::new(),
-                action_name: "test_tool".into(),
-                output: serde_json::json!({"error": "No lease for action 'test_tool'"}),
-                is_error: true,
-                duration: Duration::from_millis(1),
-            })],
-            ThreadConfig::default(),
-        )
-        .await;
-
-        exec.run().await.unwrap();
-
-        let action_results: Vec<_> = exec
-            .thread
-            .internal_messages
-            .iter()
-            .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
-            .collect();
-
-        assert!(
-            action_results.iter().any(|m| {
-                m.content.contains("[ACTION FAILED] test_tool:")
-                    && m.content.contains("No lease for action 'test_tool'")
-            }),
-            "failed ActionResult content should be explicit for the next LLM turn"
-        );
-    }
-
     /// Verify the trace analyzer does NOT flag any issues on a clean
-    /// action execution (no empty call_ids).
+    /// code-path execution (no empty call_ids).
     #[tokio::test]
     async fn trace_analysis_clean_after_successful_tool_use() {
         let (mut exec, _tx) = make_loop(
-            vec![
-                action_response("test_tool", "call_clean_id"),
-                text_response("All done"),
-            ],
+            vec![code_response(
+                "result = test_tool()\nFINAL('All done')",
+            )],
             vec![Ok(ActionResult {
                 call_id: String::new(),
                 action_name: "test_tool".into(),

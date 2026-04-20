@@ -3312,13 +3312,12 @@ mod tests {
         responses: Mutex<Vec<LlmOutput>>,
     }
 
+    use crate::testing::code_final;
+
     impl MockLlm {
         fn text(msg: &str) -> Arc<Self> {
             Arc::new(Self {
-                responses: Mutex::new(vec![LlmOutput {
-                    response: LlmResponse::Text(msg.into()),
-                    usage: TokenUsage::default(),
-                }]),
+                responses: Mutex::new(vec![code_final(msg)]),
             })
         }
     }
@@ -3333,10 +3332,7 @@ mod tests {
         ) -> Result<LlmOutput, EngineError> {
             let mut r = self.responses.lock().unwrap();
             if r.is_empty() {
-                Ok(LlmOutput {
-                    response: LlmResponse::Text("done".into()),
-                    usage: TokenUsage::default(),
-                })
+                Ok(code_final("done"))
             } else {
                 Ok(r.remove(0))
             }

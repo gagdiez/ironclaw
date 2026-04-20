@@ -646,6 +646,28 @@ async fn handle_llm_complete(
         metadata: HashMap::new(),
     };
 
+    let tid = thread.id.to_string();
+    super::trace_dump::dump(
+        "llm_in",
+        &tid,
+        &serde_json::json!({
+            "messages": messages.iter().map(|m| serde_json::json!({
+                "role": format!("{:?}", m.role),
+                "content": m.content,
+                "action_name": m.action_name,
+                "action_call_id": m.action_call_id,
+            })).collect::<Vec<_>>(),
+            "action_count": actions.len(),
+            "config": {
+                "max_tokens": config.max_tokens,
+                "temperature": config.temperature,
+                "force_text": config.force_text,
+                "model": config.model,
+                "depth": config.depth,
+            },
+        }),
+    );
+
     match deps.llm.complete(&messages, &actions, &config).await {
         Ok(output) => {
             total_tokens.input_tokens += output.usage.input_tokens;
@@ -662,8 +684,16 @@ async fn handle_llm_complete(
                 LlmResponse::Text(text) => {
                     serde_json::json!({"type": "text", "content": text, "usage": usage})
                 }
-                LlmResponse::Code { code, .. } => {
-                    serde_json::json!({"type": "code", "code": code, "usage": usage})
+                LlmResponse::Code { code, content } => {
+                    // Carry `content` through so Python consumers (e.g.
+                    // compaction, trace recording) can see the full model
+                    // response, not just the extracted code block.
+                    serde_json::json!({
+                        "type": "code",
+                        "code": code,
+                        "content": content.unwrap_or_default(),
+                        "usage": usage,
+                    })
                 }
                 LlmResponse::ActionCalls { calls, content } => {
                     // Single source of truth for the Python interchange
@@ -678,12 +708,21 @@ async fn handle_llm_complete(
                 }
             };
 
+            super::trace_dump::dump("llm_out", &tid, &result);
+
             ExtFunctionResult::Return(json_to_monty(&result))
         }
-        Err(e) => ExtFunctionResult::Error(monty::MontyException::new(
-            monty::ExcType::RuntimeError,
-            Some(format!("LLM call failed: {e}")),
-        )),
+        Err(e) => {
+            super::trace_dump::dump(
+                "llm_err",
+                &tid,
+                &serde_json::json!({ "error": e.to_string() }),
+            );
+            ExtFunctionResult::Error(monty::MontyException::new(
+                monty::ExcType::RuntimeError,
+                Some(format!("LLM call failed: {e}")),
+            ))
+        }
     }
 }
 
@@ -727,6 +766,16 @@ async fn handle_execute_code_step(
         source_channel: thread_source_channel(thread),
         user_timezone: thread_user_timezone(thread),
     };
+
+    let tid = thread.id.to_string();
+    super::trace_dump::dump(
+        "code_in",
+        &tid,
+        &serde_json::json!({
+            "code": code,
+            "state": state,
+        }),
+    );
 
     // Run user code in a nested Monty VM (same pattern as rlm_query)
     let code_start = std::time::Instant::now();
@@ -843,12 +892,21 @@ async fn handle_execute_code_step(
                 }),
             });
 
+            super::trace_dump::dump("code_out", &tid, &result_json);
+
             ExtFunctionResult::Return(json_to_monty(&result_json))
         }
-        Err(e) => ExtFunctionResult::Error(monty::MontyException::new(
-            monty::ExcType::RuntimeError,
-            Some(format!("Code execution failed: {e}")),
-        )),
+        Err(e) => {
+            super::trace_dump::dump(
+                "code_err",
+                &tid,
+                &serde_json::json!({ "error": e.to_string() }),
+            );
+            ExtFunctionResult::Error(monty::MontyException::new(
+                monty::ExcType::RuntimeError,
+                Some(format!("Code execution failed: {e}")),
+            ))
+        }
     }
 }
 
@@ -2186,10 +2244,6 @@ fn build_orchestrator_inputs(
     // Build config
     let config = serde_json::json!({
         "max_iterations": thread.config.max_iterations,
-        "max_tool_intent_nudges": thread.config.max_tool_intent_nudges,
-        "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
-        "require_action_attempt": thread.config.require_action_attempt,
-        "max_action_requirement_nudges": thread.config.max_action_requirement_nudges,
         "max_consecutive_errors": thread.config.max_consecutive_errors,
         "max_tokens_total": thread.config.max_tokens_total,
         "max_budget_usd": thread.config.max_budget_usd,
@@ -2567,11 +2621,10 @@ mod tests {
     use crate::types::memory::{DocType, MemoryDoc};
     use crate::types::project::ProjectId;
 
-    // ── Python helper unit tests via Monty ──────────────────────
+    // ── Monty harness for driving Python from Rust tests ──────
     //
-    // Extracts the helper functions from the default orchestrator and
-    // evaluates `signals_tool_intent(text)` directly, mirroring the V1
-    // Rust unit test suite in src/llm/reasoning.rs.
+    // Runs snippets against the orchestrator helper prelude and returns
+    // the FINAL() value. Used by `__regex_match__` reachability tests.
 
     /// Run a Python expression that returns a bool by prepending the
     /// orchestrator helper definitions and wrapping in `FINAL(expr)`.
@@ -2650,6 +2703,27 @@ mod tests {
         }
     }
 
+    /// Reviewer finding #4 (caller-level regression): the next turn's
+    /// transcript must contain the tool name AND the error cause when a
+    /// tool call fails, otherwise the LLM has nothing to diagnose and
+    /// retry from. Under code-only, the format_output helper produces
+    /// that string from the action_results list.
+    #[test]
+    fn format_output_surfaces_failing_tool_name_and_error() {
+        let program = r#"
+msg = format_output({
+    "action_results": [{
+        "action_name": "failing_http",
+        "is_error": True,
+        "output": "connection refused: api.example.com:443",
+    }],
+})
+FINAL(int("failing_http" in msg) + int("connection refused" in msg))
+"#;
+        // Both substrings must appear — we want 2.
+        assert_eq!(eval_python_int(program), 2);
+    }
+
     // ── __regex_match__ host function reachability ───────────────
 
     #[test]
@@ -2668,156 +2742,6 @@ mod tests {
         // Invalid pattern should return false silently (the host function
         // swallows the compile error).
         assert!(!eval_python_bool(r#"bool(__regex_match__("[", "abc"))"#));
-    }
-
-    // ── True positives (should trigger nudge) ───────────────────
-
-    #[test]
-    fn signals_tool_intent_true_positives() {
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("Let me search for that file.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("I'll fetch the data now.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("I'm going to check the logs.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("Let me add it now.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("I will run the tests to verify.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("I'll look up the documentation.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("Let me read the file contents.")"#
-        ));
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("I'm going to execute the command.")"#
-        ));
-    }
-
-    // ── True negatives: conversational phrases ──────────────────
-
-    #[test]
-    fn signals_tool_intent_true_negatives_conversational() {
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Let me explain how this works.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Let me know if you need anything.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Let me think about this.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Let me summarize the findings.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Let me clarify what I mean.")"#
-        ));
-    }
-
-    // ── Exclusion takes precedence ──────────────────────────────
-
-    #[test]
-    fn signals_tool_intent_exclusion_takes_precedence() {
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Let me explain the approach, then I'll search for the file.")"#
-        ));
-    }
-
-    // ── Code blocks are stripped ────────────────────────────────
-
-    #[test]
-    fn signals_tool_intent_ignores_code_blocks() {
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Here's the code:\n\n```\nfn main() {\n    println!(\"Let me search the database\");\n}\n```")"#
-        ));
-    }
-
-    #[test]
-    fn signals_tool_intent_ignores_indented_code() {
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Here's the code:\n\n    println!(\"I'll fetch the data\");\n\nThat's it.")"#
-        ));
-    }
-
-    // ── Plain informational text ────────────────────────────────
-
-    #[test]
-    fn signals_tool_intent_ignores_plain_text() {
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("The task is complete.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Here are the results you asked for.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("I found 3 matching files.")"#
-        ));
-    }
-
-    // ── Quoted strings are stripped ─────────────────────────────
-
-    #[test]
-    fn signals_tool_intent_ignores_quoted_strings() {
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("The button says \"Let me search the database\" to the user.")"#
-        ));
-        // But unquoted intent should still trigger
-        assert!(eval_python_bool(
-            r#"signals_tool_intent("I'll fetch the results for you.")"#
-        ));
-    }
-
-    // ── Shadowed prefix (exclusion cancels all) ─────────────────
-
-    #[test]
-    fn signals_tool_intent_shadowed_prefix() {
-        // "let me think" is an exclusion → entire text returns false
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Sure, let me think about it. Actually, let me search for the file.")"#
-        ));
-    }
-
-    // ── Regression: trace false positive (news content) ─────────
-
-    #[test]
-    fn signals_tool_intent_no_false_positive_news_content() {
-        // "I can" + "call" in news content triggered false positive in old code
-        let news_response = concat!(
-            "The latest headlines suggest this is a fast-moving war.\n",
-            "- Reuters: Iran is calling US peace proposals unrealistic.\n",
-            "If you want, I can do one of these next:\n",
-            "1. give you a 5-bullet update\n",
-            "2. focus just on military developments",
-        );
-        assert!(!eval_python_bool(&format!(
-            "signals_tool_intent({news_response:?})"
-        )));
-    }
-
-    #[test]
-    fn signals_tool_intent_no_false_positive_past_tense() {
-        // "I fetched" / "I already called" should not trigger
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("I already completed the needed action call by fetching current news feeds.")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("Current status from the live feeds I fetched:")"#
-        ));
-    }
-
-    #[test]
-    fn signals_tool_intent_no_false_positive_offer() {
-        // "If you want, I can fetch..." uses "I can" which is not a V1 prefix
-        assert!(!eval_python_bool(
-            r#"signals_tool_intent("If you want, I can next fetch a cleaner update.")"#
-        ));
     }
 
     #[tokio::test]

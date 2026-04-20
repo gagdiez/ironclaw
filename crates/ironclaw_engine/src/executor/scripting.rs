@@ -1382,7 +1382,6 @@ async fn handle_rlm_query(
     // Build child thread with inherited budget
     let child_config = crate::types::thread::ThreadConfig {
         max_iterations: parent_thread.config.max_iterations.min(20), // cap child iterations
-        enable_tool_intent_nudge: false,
         max_tokens_total: parent_thread
             .config
             .max_tokens_total
@@ -1535,12 +1534,9 @@ async fn resolve_tool_future(
 ) -> ExtFunctionResult {
     match handle.await {
         Ok(Ok(result)) => {
-            // If the effect adapter wrapped a tool error as an Ok(ActionResult)
-            // with is_error=true (current convention in
-            // `EffectBridgeAdapter::execute_action_internal`), surface it as
-            // ActionFailed so traces, observers, and approval flows see the
-            // failure correctly. Without this, every wrapped error looked like
-            // a successful tool call to downstream consumers.
+            // Match Python semantics: a failed call raises. gather() without
+            // return_exceptions=True then propagates; with it, gather catches
+            // and returns the exception as a value — same as CPython.
             if result.is_error {
                 let error_msg = result
                     .output
@@ -1552,9 +1548,14 @@ async fn resolve_tool_future(
                     step_id: context.step_id,
                     action_name: action_name.into(),
                     call_id: call_id.into(),
-                    error: error_msg,
+                    error: error_msg.clone(),
                     params_summary,
                 });
+                action_results.push(result);
+                ExtFunctionResult::Error(MontyException::new(
+                    ExcType::RuntimeError,
+                    Some(format!("{action_name}: {error_msg}")),
+                ))
             } else {
                 events.push(EventKind::ActionExecuted {
                     step_id: context.step_id,
@@ -1563,10 +1564,10 @@ async fn resolve_tool_future(
                     duration_ms: result.duration.as_millis() as u64,
                     params_summary,
                 });
+                let monty_val = json_to_monty(&result.output);
+                action_results.push(result);
+                ExtFunctionResult::Return(monty_val)
             }
-            let monty_val = json_to_monty(&result.output);
-            action_results.push(result);
-            ExtFunctionResult::Return(monty_val)
         }
         Ok(Err(EngineError::GatePaused {
             gate_name,
@@ -2260,6 +2261,144 @@ FINAL(str(results[0]))
         assert!(result.failure.is_none(), "stdout: {}", result.stdout);
         assert_eq!(result.final_answer.as_deref(), Some("gathered"));
         assert_eq!(result.action_results.len(), 1);
+    }
+
+    // ── is_error raises an exception (Python parity) ───────────
+
+    fn action_err(name: &str, msg: &str) -> Result<ActionResult, EngineError> {
+        Ok(ActionResult {
+            call_id: String::new(),
+            action_name: name.into(),
+            output: serde_json::json!({"error": msg}),
+            is_error: true,
+            duration: Duration::from_millis(1),
+        })
+    }
+
+    /// Core invariant: a tool call with `is_error=true` must raise a Python
+    /// exception — not silently return a dict. Previously every wrapped tool
+    /// error looked like a successful call (`{is_error: true, output: ...}`
+    /// as a return value), and the LLM routinely FINAL'd with "success"
+    /// while every call had actually failed.
+    #[tokio::test]
+    async fn tool_error_raises_python_exception_not_returns_value() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("failer")],
+            vec![action_err("failer", "tool-boom")],
+        ));
+        let code = r#"
+r = await failer()
+FINAL("SHOULD NOT REACH: " + str(r))
+"#;
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(result.final_answer.is_none(), "FINAL should not run after a failed tool call");
+        assert!(result.failure.is_some(), "script must be marked failed");
+        assert!(
+            result.stdout.contains("tool-boom"),
+            "error message must surface in stdout, got: {}",
+            result.stdout
+        );
+    }
+
+    /// asyncio.gather with a failing call must also fail the script (matches
+    /// Python's default gather behavior: first failure propagates, caller sees
+    /// it as an unhandled exception).
+    #[tokio::test]
+    async fn gather_with_failure_fails_the_script() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("a"), test_action("b")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "a".into(),
+                    output: serde_json::json!("ok-a"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                action_err("b", "boom-b"),
+            ],
+        ));
+        let code = r#"
+import asyncio
+r = await asyncio.gather(a(), b())
+FINAL("SHOULD NOT REACH: " + str(r))
+"#;
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(result.final_answer.is_none(), "FINAL should not run when any gather call fails");
+        assert!(result.failure.is_some(), "script must be marked failed");
+        assert!(
+            result.stdout.contains("boom-b"),
+            "error from failing call must surface, got: {}",
+            result.stdout
+        );
+    }
+
+    /// Sanity check: gather with all-successful calls still works.
+    #[tokio::test]
+    async fn gather_with_all_success_returns_list() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("a"), test_action("b")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "a".into(),
+                    output: serde_json::json!("ok-a"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "b".into(),
+                    output: serde_json::json!("ok-b"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+        let code = r#"
+import asyncio
+r = await asyncio.gather(a(), b())
+FINAL(str(r))
+"#;
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(result.failure.is_none(), "all-success gather must not fail");
+        let ans = result.final_answer.unwrap_or_default();
+        assert!(ans.contains("ok-a") && ans.contains("ok-b"), "got: {ans}");
+    }
+
+    /// Known Monty limitation (not a bug in our dispatch): `try`/`except`
+    /// around `await` does NOT catch exceptions raised from host functions —
+    /// they bubble straight out as script-level failures. Pure-Python raises
+    /// caught by try/except work fine (see the generic test suite elsewhere).
+    ///
+    /// This diverges from CPython where `try: await f() except: ...` catches
+    /// normally. Kept as a regression marker: if Monty ever gains proper
+    /// exception propagation across await, this test will start failing and
+    /// we can update the preamble to document try/except-await as supported.
+    #[tokio::test]
+    async fn known_limitation_try_except_does_not_catch_across_await() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("failer")],
+            vec![action_err("failer", "bubbles-out")],
+        ));
+        let code = r#"
+try:
+    await failer()
+    FINAL("NO EXCEPTION")
+except Exception as e:
+    FINAL("caught: " + str(e))
+"#;
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(
+            result.final_answer.is_none(),
+            "if this starts passing with final='caught: ...' then Monty now supports \
+             try/except across await — update the preamble guidance"
+        );
+        assert!(result.failure.is_some());
     }
 
     // ── Sandbox security negative tests ────────────────────────

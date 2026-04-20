@@ -585,6 +585,8 @@ mod tests {
 
     // ── Mocks (same as manager tests) ───────────────────────
 
+    use crate::testing::code_final;
+
     struct MockLlm(Mutex<Vec<LlmOutput>>);
 
     #[async_trait::async_trait]
@@ -597,10 +599,7 @@ mod tests {
         ) -> Result<LlmOutput, EngineError> {
             let mut r = self.0.lock().unwrap();
             if r.is_empty() {
-                Ok(LlmOutput {
-                    response: LlmResponse::Text("done".into()),
-                    usage: TokenUsage::default(),
-                })
+                Ok(code_final("done"))
             } else {
                 Ok(r.remove(0))
             }
@@ -797,10 +796,7 @@ mod tests {
     fn make_conv_manager() -> (Arc<ThreadManager>, ConversationManager) {
         let store = Arc::new(MockStore::new());
         let tm = Arc::new(ThreadManager::new(
-            Arc::new(MockLlm(Mutex::new(vec![LlmOutput {
-                response: LlmResponse::Text("Hello!".into()),
-                usage: TokenUsage::default(),
-            }]))),
+            Arc::new(MockLlm(Mutex::new(vec![code_final("Hello!")]))),
             Arc::new(MockEffects),
             store.clone(),
             Arc::new(CapabilityRegistry::new()),
@@ -865,10 +861,7 @@ mod tests {
     async fn handle_message_resumes_suspended_thread() {
         let store = Arc::new(MockStore::new());
         let tm = Arc::new(ThreadManager::new(
-            Arc::new(MockLlm(Mutex::new(vec![LlmOutput {
-                response: LlmResponse::Text("Recovered".into()),
-                usage: TokenUsage::default(),
-            }]))),
+            Arc::new(MockLlm(Mutex::new(vec![code_final("Recovered")]))),
             Arc::new(MockEffects),
             store.clone(),
             Arc::new(CapabilityRegistry::new()),

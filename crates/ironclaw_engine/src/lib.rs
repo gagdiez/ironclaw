@@ -29,6 +29,7 @@ pub mod gate;
 pub mod memory;
 pub mod reliability;
 pub mod runtime;
+pub mod testing;
 pub mod traits;
 pub mod types;
 
