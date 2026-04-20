@@ -2903,14 +2903,7 @@ async fn handle_with_engine_inner(
         .as_deref()
         .and_then(ironclaw_engine::ValidTimezone::parse);
 
-    // Detect execution intent and configure obligation accordingly
-    let thread_config = {
-        let mut cfg = ThreadConfig::default();
-        if crate::llm::user_signals_execution_intent(content) {
-            cfg.require_action_attempt = true;
-        }
-        cfg
-    };
+    let thread_config = ThreadConfig::default();
 
     // Handle the message — spawns a new thread or injects into active one
     let thread_id = state
@@ -5854,10 +5847,7 @@ mod tests {
                 _: &[ironclaw_engine::ActionDef],
                 _: &ironclaw_engine::LlmCallConfig,
             ) -> Result<ironclaw_engine::LlmOutput, ironclaw_engine::EngineError> {
-                Ok(ironclaw_engine::LlmOutput {
-                    response: ironclaw_engine::LlmResponse::Text("done".into()),
-                    usage: ironclaw_engine::TokenUsage::default(),
-                })
+                Ok(ironclaw_engine::testing::code_final("done"))
             }
             fn model_name(&self) -> &str {
                 "noop"
@@ -6143,14 +6133,8 @@ mod tests {
                         && message.action_call_id.as_deref() == Some(self.expected_call_id.as_str())
                 });
 
-                Ok(ironclaw_engine::LlmOutput {
-                    response: ironclaw_engine::LlmResponse::Text(if matched {
-                        "paired".into()
-                    } else {
-                        "missing-pairing".into()
-                    }),
-                    usage: ironclaw_engine::TokenUsage::default(),
-                })
+                let answer = if matched { "paired" } else { "missing-pairing" };
+                Ok(ironclaw_engine::testing::code_final(answer))
             }
 
             fn model_name(&self) -> &str {
@@ -6751,10 +6735,7 @@ mod tests {
                 _: &[ironclaw_engine::ActionDef],
                 _: &ironclaw_engine::LlmCallConfig,
             ) -> Result<ironclaw_engine::LlmOutput, ironclaw_engine::EngineError> {
-                Ok(ironclaw_engine::LlmOutput {
-                    response: ironclaw_engine::LlmResponse::Text("ok".into()),
-                    usage: ironclaw_engine::TokenUsage::default(),
-                })
+                Ok(ironclaw_engine::testing::code_final("ok"))
             }
             fn model_name(&self) -> &str {
                 "noop"

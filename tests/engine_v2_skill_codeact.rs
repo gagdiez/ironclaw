@@ -51,10 +51,7 @@ impl LlmBackend for ScriptedLlm {
     ) -> Result<LlmOutput, EngineError> {
         let mut queue = self.responses.lock().unwrap();
         if queue.is_empty() {
-            Ok(LlmOutput {
-                response: LlmResponse::Text("done".into()),
-                usage: TokenUsage::default(),
-            })
+            Ok(ironclaw_engine::testing::code_final("done"))
         } else {
             Ok(queue.remove(0))
         }
@@ -597,11 +594,10 @@ async fn non_matching_goal_skips_skill_codeact() {
 
     let skill_doc = make_github_skill_doc(project_id);
 
-    // LLM just returns text — no code execution needed
-    let llm = ScriptedLlm::new(vec![LlmOutput {
-        response: LlmResponse::Text("The weather is sunny.".into()),
-        usage: TokenUsage::default(),
-    }]);
+    // LLM returns a direct FINAL — no tool dispatch needed for this case.
+    let llm = ScriptedLlm::new(vec![ironclaw_engine::testing::code_final(
+        "The weather is sunny.",
+    )]);
 
     let effects = HttpMockEffects::new(HashMap::new());
     let store = TestStore::new();

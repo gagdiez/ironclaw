@@ -214,6 +214,32 @@ impl EffectBridgeAdapter {
         let mgr = self.mission_manager.read().await;
         let mgr = mgr.as_ref()?;
 
+        // Accept id, mission_id, name, or positional — fail loudly on empty
+        // so a wrong kwarg name surfaces instead of becoming "invalid uuid: found 0".
+        fn resolve_mission_id(
+            params: &serde_json::Value,
+            action: &str,
+        ) -> Result<ironclaw_engine::MissionId, EngineError> {
+            let id_str = params
+                .get("id")
+                .or_else(|| params.get("mission_id"))
+                .or_else(|| params.get("name"))
+                .or_else(|| params.get("_args").and_then(|a| a.get(0)))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| EngineError::Effect {
+                    reason: format!(
+                        "{action} requires a mission id — pass `id=<uuid>` \
+                         (also accepts `mission_id`, `name`, or positional)"
+                    ),
+                })?;
+            uuid::Uuid::parse_str(id_str)
+                .map(ironclaw_engine::MissionId)
+                .map_err(|e| EngineError::Effect {
+                    reason: format!("invalid mission id {id_str:?}: {e}"),
+                })
+        }
+
         let result = match action_name {
             "mission_create" => {
                 let name = params
@@ -478,88 +504,41 @@ impl EffectBridgeAdapter {
                 }
                 Err(e) => Err(e),
             },
-            "mission_fire" => {
-                let id_str = params
-                    .get("id")
-                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let id = uuid::Uuid::parse_str(id_str)
-                    .map(ironclaw_engine::MissionId)
-                    .map_err(|e| EngineError::Effect {
-                        reason: format!("invalid mission id: {e}"),
-                    });
-                match id {
-                    Ok(id) => match mgr.fire_mission(id, &context.user_id, None).await {
-                        Ok(Some(tid)) => {
-                            Ok(serde_json::json!({"thread_id": tid.to_string(), "status": "fired"}))
-                        }
-                        Ok(None) => Ok(
-                            serde_json::json!({"status": "not_fired", "reason": "mission is terminal or budget exhausted"}),
-                        ),
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                }
-            }
-            "mission_pause" | "mission_resume" => {
-                let id_str = params
-                    .get("id")
-                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let id = uuid::Uuid::parse_str(id_str)
-                    .map(ironclaw_engine::MissionId)
-                    .map_err(|e| EngineError::Effect {
-                        reason: format!("invalid mission id: {e}"),
-                    });
-                match id {
-                    Ok(id) => {
-                        let res = if action_name == "mission_pause" {
-                            mgr.pause_mission(id, &context.user_id).await
-                        } else {
-                            mgr.resume_mission(id, &context.user_id).await
-                        };
-                        match res {
-                            Ok(()) => Ok(serde_json::json!({"status": "ok"})),
-                            Err(e) => Err(e),
-                        }
+            "mission_fire" => match resolve_mission_id(params, "mission_fire") {
+                Ok(id) => match mgr.fire_mission(id, &context.user_id, None).await {
+                    Ok(Some(tid)) => {
+                        Ok(serde_json::json!({"thread_id": tid.to_string(), "status": "fired"}))
                     }
+                    Ok(None) => Ok(
+                        serde_json::json!({"status": "not_fired", "reason": "mission is terminal or budget exhausted"}),
+                    ),
                     Err(e) => Err(e),
-                }
-            }
-            "mission_complete" => {
-                let id_str = params
-                    .get("id")
-                    .or_else(|| params.get("name")) // routine_delete uses "name" param
-                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let id = uuid::Uuid::parse_str(id_str)
-                    .map(ironclaw_engine::MissionId)
-                    .map_err(|e| EngineError::Effect {
-                        reason: format!("invalid mission id: {e}"),
-                    });
-                match id {
-                    Ok(id) => match mgr.complete_mission(id).await {
-                        Ok(()) => Ok(serde_json::json!({"status": "completed"})),
+                },
+                Err(e) => Err(e),
+            },
+            "mission_pause" | "mission_resume" => match resolve_mission_id(params, action_name) {
+                Ok(id) => {
+                    let res = if action_name == "mission_pause" {
+                        mgr.pause_mission(id, &context.user_id).await
+                    } else {
+                        mgr.resume_mission(id, &context.user_id).await
+                    };
+                    match res {
+                        Ok(()) => Ok(serde_json::json!({"status": "ok"})),
                         Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
+                    }
                 }
-            }
+                Err(e) => Err(e),
+            },
+            "mission_complete" => match resolve_mission_id(params, "mission_complete") {
+                Ok(id) => match mgr.complete_mission(id).await {
+                    Ok(()) => Ok(serde_json::json!({"status": "completed"})),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
             "mission_update" => {
-                let id_str = params
-                    .get("id")
-                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let id = uuid::Uuid::parse_str(id_str)
-                    .map(ironclaw_engine::MissionId)
-                    .map_err(|e| EngineError::Effect {
-                        reason: format!("invalid mission id: {e}"),
-                    });
-                match id {
+                match resolve_mission_id(params, "mission_update") {
                     Ok(id) => {
                         let mut updates = ironclaw_engine::MissionUpdate::default();
                         if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
@@ -3485,10 +3464,7 @@ mod tests {
                 _: &[ironclaw_engine::ActionDef],
                 _: &ironclaw_engine::LlmCallConfig,
             ) -> Result<ironclaw_engine::LlmOutput, ironclaw_engine::EngineError> {
-                Ok(ironclaw_engine::LlmOutput {
-                    response: ironclaw_engine::types::step::LlmResponse::Text("done".into()),
-                    usage: ironclaw_engine::types::step::TokenUsage::default(),
-                })
+                Ok(ironclaw_engine::testing::code_final("done"))
             }
             fn model_name(&self) -> &str {
                 "noop"
